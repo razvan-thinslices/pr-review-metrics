@@ -159,7 +159,7 @@ export default function ReviewerActivityTab({ data }: ReviewerActivityTabProps) 
             </table>
           </div>
           <div className="px-6 py-3 bg-gray-50 dark:bg-gray-900 text-xs text-gray-500 dark:text-gray-400">
-            Numbers represent the count of reviews given by each reviewer to each author's PRs
+            Numbers represent the count of reviews given by each reviewer to each author&apos;s PRs
           </div>
         </div>
       </div>

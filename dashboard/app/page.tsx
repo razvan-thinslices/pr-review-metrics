@@ -36,7 +36,7 @@ export default function Home() {
         console.error('Failed to fetch months:', err)
         setError('Failed to load available months')
       })
-  }, [])
+  }, [selectedMonth])
 
   // Fetch data when month changes
   useEffect(() => {
