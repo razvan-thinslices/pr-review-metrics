@@ -1,0 +1,9 @@
+reviewer,totalReviews,prsReviewedCount,approvals,changesRequested,commentOnlyReviews,noCommentApprovals,noCommentApprovalPct,totalInlineComments,medianResponseHours,p90ResponseHours,fastestResponseHours,avgPrSizeReviewed,avgPrProdLinesReviewed,avgPrTestLinesReviewed,avgIterationsPerPr,avgReviewedPrCloseTime,prsWithMultipleRounds,fe-redesign,be-revamp,API-docs
+"anovi-thg",35,20,14,0,21,14,100,21,"0.72","22.90","0.04",289,281,9,"3.80","21.99",15,16,3,1
+"DemetriadSinzeanu",29,21,15,0,14,15,100,23,"1.72","14.34","0.11",579,353,227,"2.90","17.36",14,18,1,2
+"MihaiBojescuTS",28,18,18,0,8,17,94.4,8,"0.33","25.79","0.02",203,84,119,"2.94","55.84",14,3,9,6
+"andreiclim-ts",25,15,12,0,13,12,100,13,"14.15","25.67","0.01",407,166,241,"3.80","43.72",13,4,7,4
+"sheldon-welinga",25,12,7,0,17,5,71.4,19,"0.38","0.38","0.38",339,332,7,"5.42","90.67",12,6,3,3
+"razvan-thinslices",15,7,5,0,8,5,100,8,"4.23","96.04","0.63",368,368,0,"4.86","44.60",6,6,"",1
+"copilot-pull-request-reviewer[bot]",4,4,0,0,4,0,0,0,"","","",1346,59,1287,"2.25","5.55",4,"",4,""
+"DanutTHG",1,1,1,0,0,1,100,0,"","","",234,234,0,"1.00","0.46",0,1,"",""
