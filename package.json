@@ -1,0 +1,11 @@
+{
+  "name": "pr-review-metrics",
+  "version": "1.0.0",
+  "description": "GitHub PR review metrics collection and visualization",
+  "type": "module",
+  "scripts": {
+    "collect": "node scripts/collect-metrics.js"
+  },
+  "keywords": ["github", "metrics", "pr-review"],
+  "private": true
+}

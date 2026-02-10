@@ -1,0 +1,15 @@
+node_modules/
+.DS_Store
+*.log
+.env
+.env.local
+
+# Include output files for Vercel deployment
+# output/*.json
+# output/*.csv
+
+# Next.js
+dashboard/.next/
+dashboard/out/
+dashboard/build/
+dashboard/dist/
