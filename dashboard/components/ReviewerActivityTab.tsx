@@ -53,7 +53,7 @@ export default function ReviewerActivityTab({ data }: ReviewerActivityTabProps) 
     reviewer,
     ...authors,
     total: Object.values(authors).reduce((sum, count) => sum + count, 0)
-  })).sort((a, b) => b.total - a.total)
+  } as Record<string, number | string>)).sort((a, b) => (b.total as number) - (a.total as number))
 
   const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316']
 
@@ -147,7 +147,7 @@ export default function ReviewerActivityTab({ data }: ReviewerActivityTabProps) 
                     </td>
                     {allAuthors.map((author) => (
                       <td key={author} className="px-4 py-3 whitespace-nowrap text-sm text-center text-gray-900 dark:text-gray-100">
-                        {row[author] || '-'}
+                        {(row[author] as number) || '-'}
                       </td>
                     ))}
                     <td className="px-4 py-3 whitespace-nowrap text-sm text-center font-semibold text-gray-900 dark:text-gray-100 bg-gray-50 dark:bg-gray-700">
