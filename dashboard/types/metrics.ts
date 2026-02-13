@@ -2,10 +2,10 @@ export interface Review {
   reviewer: string
   state: 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | 'DISMISSED'
   submittedAt: string
-  requestedAt?: string
-  responseHours: number | null
+  firstActivityAt?: string  // Earliest of: review submission, inline comment, or conversation comment
   hasComments: boolean
   inlineCommentCount: number
+  conversationCommentCount: number
   body: string
 }
 
@@ -29,6 +29,12 @@ export interface PRDetail {
   iterationCount: number
   reviews: Review[]
   error?: string
+  // First response timestamp (earliest activity by anyone other than author)
+  firstResponseAt?: string | null
+  // Churn metrics
+  commitCount?: number
+  churnPercentage?: number
+  fileChurnCount?: number
 }
 
 export interface ReviewerSummary {
@@ -41,6 +47,8 @@ export interface ReviewerSummary {
   noCommentApprovals: number
   noCommentApprovalPct: number
   totalInlineComments: number
+  totalConversationComments: number
+  // Response times are calendar hours from PR open to first activity
   medianResponseHours: string | null
   p90ResponseHours: string | null
   fastestResponseHours: string | null
@@ -48,7 +56,7 @@ export interface ReviewerSummary {
   avgPrProdLinesReviewed: number
   avgPrTestLinesReviewed: number
   avgIterationsPerPr: string
-  avgReviewedPrCloseTime: string | null
+  avgReviewedPrCloseTime: string | null  // Calendar hours
   prsWithMultipleRounds: number
   [key: string]: string | number | null | undefined // For repo-specific columns
 }
@@ -59,11 +67,40 @@ export interface AuthorSummary {
   authoredPrAvgSize: number
   authoredPrAvgProdLines: number
   authoredPrAvgTestLines: number
-  authoredPrAvgReviewTime: string | null  // Hours to first review
-  authoredPrAvgCloseTime: string          // Hours to merge
+  authoredPrAvgReviewTime: string | null  // Calendar hours to first response
+  authoredPrAvgCloseTime: string          // Calendar hours to merge
   authoredPrAvgReviewCount: string        // Avg reviews received
   authoredPrAvgIterations: string         // Avg iterations
+  authoredPrAvgCommits?: string
+  authoredPrAvgChurnPct?: string
+  authoredPrAvgFileChurn?: string
   [key: string]: string | number | null | undefined // For repo-specific columns
+}
+
+export interface TeamSummary {
+  authored: {
+    totalPRs: number
+    totalDevelopers: number
+    avgPrSize: number
+    avgProdLines: number
+    avgTestLines: number
+    avgCloseTime: number | null  // Working hours
+    avgIterations: number
+    avgChurnPct: number
+    avgFileChurn: number
+    avgCommitsPerPr: number
+  }
+  reviewed: {
+    totalReviews: number
+    totalReviewers: number
+    avgPrSizeReviewed: number
+    avgProdLinesReviewed: number
+    avgTestLinesReviewed: number
+    medianResponseTime: number | null  // Working hours
+    overallNoCommentPct: number
+    avgInlineComments: number
+    avgIterationsPerPr: number
+  }
 }
 
 export interface MetricsData {
@@ -73,5 +110,6 @@ export interface MetricsData {
   generatedAt: string
   summary: ReviewerSummary[]
   authorSummary: AuthorSummary[]
+  teamSummary?: TeamSummary  // Optional for backward compatibility
   details: PRDetail[]
 }

@@ -40,6 +40,67 @@ function getTargetMonth(monthArg) {
 // Sleep utility for retries
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
+// Calculate working hours between two timestamps
+// Removes: 16 hours per night (6pm-10am) and full weekends (48h Sat+Sun)
+function calculateWorkingHours(startISO, endISO) {
+  const start = new Date(startISO)
+  const end = new Date(endISO)
+  
+  if (end <= start) return 0
+  
+  const MS_PER_HOUR = 1000 * 60 * 60
+  const totalCalendarHours = (end - start) / MS_PER_HOUR
+  
+  let hoursToRemove = 0
+  
+  // Walk day by day
+  const currentDay = new Date(start)
+  currentDay.setHours(0, 0, 0, 0) // Start of the day
+  
+  while (currentDay < end) {
+    const dayOfWeek = currentDay.getDay() // 0=Sun, 6=Sat
+    const dayStart = new Date(currentDay)
+    const dayEnd = new Date(currentDay)
+    dayEnd.setDate(dayEnd.getDate() + 1)
+    
+    if (dayOfWeek === 0 || dayOfWeek === 6) {
+      // Weekend day: remove all overlapping hours
+      const overlapStart = Math.max(start.getTime(), dayStart.getTime())
+      const overlapEnd = Math.min(end.getTime(), dayEnd.getTime())
+      if (overlapEnd > overlapStart) {
+        hoursToRemove += (overlapEnd - overlapStart) / MS_PER_HOUR
+      }
+    } else {
+      // Weekday: remove night hours (6pm to 10am next day = 16 hours)
+      // Evening: 6pm (18:00) to midnight
+      const eveningStart = new Date(currentDay)
+      eveningStart.setHours(18, 0, 0, 0)
+      const eveningEnd = new Date(dayEnd)
+      
+      const eveningOverlapStart = Math.max(start.getTime(), eveningStart.getTime())
+      const eveningOverlapEnd = Math.min(end.getTime(), eveningEnd.getTime())
+      if (eveningOverlapEnd > eveningOverlapStart) {
+        hoursToRemove += (eveningOverlapEnd - eveningOverlapStart) / MS_PER_HOUR
+      }
+      
+      // Morning: midnight to 10am
+      const morningStart = new Date(dayStart)
+      const morningEnd = new Date(currentDay)
+      morningEnd.setHours(10, 0, 0, 0)
+      
+      const morningOverlapStart = Math.max(start.getTime(), morningStart.getTime())
+      const morningOverlapEnd = Math.min(end.getTime(), morningEnd.getTime())
+      if (morningOverlapEnd > morningOverlapStart) {
+        hoursToRemove += (morningOverlapEnd - morningOverlapStart) / MS_PER_HOUR
+      }
+    }
+    
+    currentDay.setDate(currentDay.getDate() + 1)
+  }
+  
+  return Math.max(0, totalCalendarHours - hoursToRemove)
+}
+
 // Execute gh CLI command with retry logic
 async function ghApiWithRetry(endpoint, paginate = false) {
   for (let attempt = 0; attempt < config.maxRetries; attempt++) {
@@ -81,6 +142,80 @@ async function checkRateLimit() {
   } catch (error) {
     console.warn('⚠️  Could not check rate limit')
     return null
+  }
+}
+
+// Fetch commits for a PR with detailed file information
+async function fetchPRCommits(org, repo, prNumber) {
+  try {
+    const commits = await ghApiWithRetry(
+      `repos/${org}/${repo}/pulls/${prNumber}/commits`,
+      true
+    )
+    
+    const detailed = []
+    for (const commit of commits) {
+      try {
+        const detail = await ghApiWithRetry(
+          `repos/${org}/${repo}/commits/${commit.sha}`
+        )
+        detailed.push({
+          sha: commit.sha,
+          date: commit.commit.author.date,
+          files: (detail.files || []).map(f => ({
+            filename: f.filename,
+            additions: f.additions || 0,
+            deletions: f.deletions || 0,
+            status: f.status
+          }))
+        })
+      } catch (error) {
+        console.warn(`      Warning: Could not fetch commit details for ${commit.sha.slice(0, 7)}`)
+      }
+    }
+    return detailed
+  } catch (error) {
+    console.warn(`      Warning: Could not fetch commits for PR #${prNumber}`)
+    return []
+  }
+}
+
+// Calculate churn metrics from commits
+// Churn = lines added to files that were already modified in previous commits
+function calculateChurnMetrics(commits) {
+  if (!commits || commits.length <= 1) {
+    return { churnPercentage: 0, fileChurnCount: 0 }
+  }
+  
+  const fileSeenInCommit = new Map() // filename -> Set<commitIndex>
+  let totalAdditions = 0
+  let reWorkAdditions = 0
+  
+  commits.forEach((commit, idx) => {
+    for (const file of commit.files) {
+      totalAdditions += file.additions
+      
+      if (!fileSeenInCommit.has(file.filename)) {
+        fileSeenInCommit.set(file.filename, new Set())
+      }
+      
+      const seen = fileSeenInCommit.get(file.filename)
+      if (seen.size > 0) {
+        // File was touched in a previous commit - this is re-work
+        reWorkAdditions += file.additions
+      }
+      seen.add(idx)
+    }
+  })
+  
+  const fileChurnCount = Array.from(fileSeenInCommit.values())
+    .filter(s => s.size > 1).length
+  
+  return {
+    churnPercentage: totalAdditions > 0
+      ? parseFloat((reWorkAdditions / totalAdditions * 100).toFixed(1))
+      : 0,
+    fileChurnCount
   }
 }
 
@@ -142,6 +277,8 @@ async function fetchMergedPRs(org, repo, targetMonth) {
   // Filter for PRs merged in target month
   const mergedPRs = prs.filter(pr => {
     if (!pr.merged_at) return false
+    // Only include PRs targeting main branch
+    if (pr.base?.ref !== 'main') return false
     const mergedDate = new Date(pr.merged_at)
     return mergedDate >= startDate && mergedDate <= endDate
   })
@@ -171,17 +308,40 @@ async function processPR(org, pr, index, total) {
     // Fetch reviews
     const reviews = await ghApiWithRetry(`repos/${org}/${pr.repo}/pulls/${pr.number}/reviews`)
     
-    // Fetch timeline to get review request timestamps
+    // Fetch timeline (we keep this for potential future use but don't use requestedAt anymore)
     const timeline = await ghApiWithRetry(`repos/${org}/${pr.repo}/issues/${pr.number}/timeline`, true)
     
-    // Extract review request events
-    const reviewRequests = new Map()
-    for (const event of timeline) {
-      if (event.event === 'review_requested' && event.requested_reviewer) {
-        const reviewer = event.requested_reviewer.login
-        if (!reviewRequests.has(reviewer)) {
-          reviewRequests.set(reviewer, event.created_at)
+    // Fetch PR conversation comments (general comments on the PR thread)
+    // These are separate from inline review comments and review body comments
+    let prConversationComments = []
+    try {
+      prConversationComments = await ghApiWithRetry(
+        `repos/${org}/${pr.repo}/issues/${pr.number}/comments`,
+        true
+      )
+    } catch (error) {
+      console.warn(`      ⚠️  Could not fetch conversation comments for PR #${pr.number}`)
+    }
+    
+    // Build a map of users to their conversation comment timestamps
+    const userConversationCommentTimestamps = new Map()
+    for (const comment of prConversationComments) {
+      const user = comment.user?.login
+      if (user) {
+        if (!userConversationCommentTimestamps.has(user)) {
+          userConversationCommentTimestamps.set(user, [])
         }
+        userConversationCommentTimestamps.get(user).push(comment.created_at)
+      }
+    }
+    
+    // Track all response timestamps for firstResponseAt calculation (excluding PR author)
+    const allResponseTimestamps = []
+    
+    // Add conversation comment timestamps from non-authors
+    for (const [user, timestamps] of userConversationCommentTimestamps) {
+      if (user !== pr.author) {
+        allResponseTimestamps.push(...timestamps)
       }
     }
     
@@ -199,38 +359,78 @@ async function processPR(org, pr, index, total) {
       }
       
       const reviewer = review.user.login
-      const requestedAt = reviewRequests.get(reviewer)
       const submittedAt = review.submitted_at
       
-      let responseHours = null
-      if (requestedAt && submittedAt) {
-        const requestTime = new Date(requestedAt)
-        const submitTime = new Date(submittedAt)
-        responseHours = (submitTime - requestTime) / (1000 * 60 * 60)
+      // Collect all activity timestamps for this reviewer to find their firstActivityAt
+      const reviewerActivityTimestamps = []
+      
+      // Add review submission time
+      if (submittedAt) {
+        reviewerActivityTimestamps.push(submittedAt)
       }
       
-      const hasComments = (review.body && review.body.trim().length > 0) || inlineComments.length > 0
+      // Add inline comment timestamps
+      for (const inlineComment of inlineComments) {
+        if (inlineComment.created_at) {
+          reviewerActivityTimestamps.push(inlineComment.created_at)
+        }
+      }
+      
+      // Add conversation comment timestamps for this reviewer
+      const conversationTimestamps = userConversationCommentTimestamps.get(reviewer) || []
+      reviewerActivityTimestamps.push(...conversationTimestamps)
+      
+      // Find the earliest activity timestamp for this reviewer
+      const firstActivityAt = reviewerActivityTimestamps.length > 0
+        ? reviewerActivityTimestamps.sort((a, b) => new Date(a) - new Date(b))[0]
+        : submittedAt
+      
+      // Add to global response timestamps if not the PR author
+      if (reviewer !== pr.author) {
+        allResponseTimestamps.push(...reviewerActivityTimestamps)
+      }
+      
+      // Check for comments: review body, inline comments, OR conversation comments
+      const hasReviewBodyComment = review.body && review.body.trim().length > 0
+      const hasInlineComments = inlineComments.length > 0
+      const hasConversationComments = conversationTimestamps.length > 0
+      const hasComments = hasReviewBodyComment || hasInlineComments || hasConversationComments
       
       processedReviews.push({
         reviewer,
         state: review.state,
         submittedAt,
-        requestedAt,
-        responseHours,
+        firstActivityAt,
         hasComments,
         inlineCommentCount: inlineComments.length,
+        conversationCommentCount: conversationTimestamps.length,
         body: review.body || ''
       })
     }
     
+    // Calculate firstResponseAt: earliest activity by anyone other than the PR author
+    const firstResponseAt = allResponseTimestamps.length > 0
+      ? allResponseTimestamps.sort((a, b) => new Date(a) - new Date(b))[0]
+      : null
+    
     // Calculate iteration count (total review submissions)
     const iterationCount = processedReviews.length
+    
+    // Fetch commits for churn analysis
+    const commits = await fetchPRCommits(org, pr.repo, pr.number)
+    const churnMetrics = calculateChurnMetrics(commits)
     
     return {
       ...pr,
       ...fileMetrics,
       iterationCount,
-      reviews: processedReviews
+      reviews: processedReviews,
+      // First response timestamp (for working hours calculation client-side)
+      firstResponseAt,
+      // Churn metrics
+      commitCount: commits.length || 1,
+      churnPercentage: churnMetrics.churnPercentage,
+      fileChurnCount: churnMetrics.fileChurnCount
     }
   } catch (error) {
     console.error(`      ❌ Error processing PR #${pr.number}: ${error.message}`)
@@ -288,13 +488,15 @@ function calculateReviewerSummary(prDetails) {
           commentOnlyReviews: 0,
           noCommentApprovals: 0,
           totalInlineComments: 0,
-          responseTimes: [],
+          totalConversationComments: 0,
+          responseTimes: [],  // Working hours from PR open to first activity
           prSizesReviewed: [],
           prProdLinesReviewed: [],
           prTestLinesReviewed: [],
           iterationsPerPr: [],
           prsReviewed: new Set(),
-          prsByRepo: {}
+          prsByRepo: {},
+          reviewedPrCloseTimes: []  // Working hours from PR open to merge
         })
       }
       
@@ -313,9 +515,14 @@ function calculateReviewerSummary(prDetails) {
       }
       
       stats.totalInlineComments += review.inlineCommentCount
+      stats.totalConversationComments += review.conversationCommentCount || 0
       
-      if (review.responseHours !== null && review.responseHours >= 0) {
-        stats.responseTimes.push(review.responseHours)
+      // Calculate response time from PR open to reviewer's first activity
+      if (review.firstActivityAt && pr.createdAt) {
+        const responseHours = calculateWorkingHours(pr.createdAt, review.firstActivityAt)
+        if (responseHours >= 0) {
+          stats.responseTimes.push(responseHours)
+        }
       }
       
       // Track PR-level metrics (only once per PR per reviewer)
@@ -326,9 +533,8 @@ function calculateReviewerSummary(prDetails) {
         stats.prTestLinesReviewed.push(pr.testAdditions + pr.testDeletions)
         stats.iterationsPerPr.push(pr.iterationCount)
         
-        // Track close time for reviewed PRs
-        const closeTime = (new Date(pr.mergedAt) - new Date(pr.createdAt)) / (1000 * 60 * 60)
-        stats.reviewedPrCloseTimes = stats.reviewedPrCloseTimes || []
+        // Track close time for reviewed PRs (working hours)
+        const closeTime = calculateWorkingHours(pr.createdAt, pr.mergedAt)
         stats.reviewedPrCloseTimes.push(closeTime)
         
         stats.prsByRepo[pr.repo] = (stats.prsByRepo[pr.repo] || 0) + 1
@@ -336,33 +542,30 @@ function calculateReviewerSummary(prDetails) {
     }
   }
   
+  // Helper functions
+  const avg = arr => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
+  const median = arr => {
+    if (arr.length === 0) return null
+    const sorted = [...arr].sort((a, b) => a - b)
+    return sorted[Math.floor(sorted.length / 2)]
+  }
+  const percentile = (arr, p) => {
+    if (arr.length === 0) return null
+    const sorted = [...arr].sort((a, b) => a - b)
+    return sorted[Math.floor(sorted.length * p)]
+  }
+  
   // Calculate final metrics
   const summary = []
   for (const [reviewer, stats] of reviewerStats) {
-    const responseTimes = stats.responseTimes.sort((a, b) => a - b)
-    const median = responseTimes.length > 0
-      ? responseTimes[Math.floor(responseTimes.length / 2)]
-      : null
-    const p90 = responseTimes.length > 0
-      ? responseTimes[Math.floor(responseTimes.length * 0.9)]
-      : null
-    const fastest = responseTimes.length > 0 ? responseTimes[0] : null
+    const medianResponse = median(stats.responseTimes)
+    const p90Response = percentile(stats.responseTimes, 0.9)
+    const fastestResponse = stats.responseTimes.length > 0 ? Math.min(...stats.responseTimes) : null
     
-    const avgPrSize = stats.prSizesReviewed.length > 0
-      ? stats.prSizesReviewed.reduce((a, b) => a + b, 0) / stats.prSizesReviewed.length
-      : 0
-    
-    const avgProdLines = stats.prProdLinesReviewed.length > 0
-      ? stats.prProdLinesReviewed.reduce((a, b) => a + b, 0) / stats.prProdLinesReviewed.length
-      : 0
-    
-    const avgTestLines = stats.prTestLinesReviewed.length > 0
-      ? stats.prTestLinesReviewed.reduce((a, b) => a + b, 0) / stats.prTestLinesReviewed.length
-      : 0
-    
-    const avgIterations = stats.iterationsPerPr.length > 0
-      ? stats.iterationsPerPr.reduce((a, b) => a + b, 0) / stats.iterationsPerPr.length
-      : 0
+    const avgPrSize = avg(stats.prSizesReviewed)
+    const avgProdLines = avg(stats.prProdLinesReviewed)
+    const avgTestLines = avg(stats.prTestLinesReviewed)
+    const avgIterations = avg(stats.iterationsPerPr)
     
     const prsWithMultipleRounds = stats.iterationsPerPr.filter(i => i > 1).length
     
@@ -370,9 +573,7 @@ function calculateReviewerSummary(prDetails) {
       ? (stats.noCommentApprovals / stats.approvals * 100).toFixed(1)
       : 0
     
-    const avgReviewedPrCloseTime = stats.reviewedPrCloseTimes && stats.reviewedPrCloseTimes.length > 0
-      ? stats.reviewedPrCloseTimes.reduce((a, b) => a + b, 0) / stats.reviewedPrCloseTimes.length
-      : null
+    const avgReviewedPrCloseTime = avg(stats.reviewedPrCloseTimes) || null
     
     summary.push({
       reviewer,
@@ -384,9 +585,11 @@ function calculateReviewerSummary(prDetails) {
       noCommentApprovals: stats.noCommentApprovals,
       noCommentApprovalPct: parseFloat(noCommentApprovalPct),
       totalInlineComments: stats.totalInlineComments,
-      medianResponseHours: median ? median.toFixed(2) : null,
-      p90ResponseHours: p90 ? p90.toFixed(2) : null,
-      fastestResponseHours: fastest ? fastest.toFixed(2) : null,
+      totalConversationComments: stats.totalConversationComments,
+      // Response times are working hours from PR open to first activity
+      medianResponseHours: medianResponse ? medianResponse.toFixed(2) : null,
+      p90ResponseHours: p90Response ? p90Response.toFixed(2) : null,
+      fastestResponseHours: fastestResponse ? fastestResponse.toFixed(2) : null,
       avgPrSizeReviewed: Math.round(avgPrSize),
       avgPrProdLinesReviewed: Math.round(avgProdLines),
       avgPrTestLinesReviewed: Math.round(avgTestLines),
@@ -415,10 +618,13 @@ function calculateAuthorSummary(prDetails) {
         prSizes: [],
         prodLines: [],
         testLines: [],
-        reviewTimes: [],    // Time to first review
-        closeTimes: [],     // Time to merge
+        reviewTimes: [],    // Calendar hours to first response
+        closeTimes: [],     // Calendar hours to merge
         reviewCounts: [],   // Number of reviews per PR
         iterations: [],
+        commitCounts: [],
+        churnPercentages: [],
+        fileChurnCounts: [],
         prsByRepo: {}
       })
     }
@@ -430,56 +636,42 @@ function calculateAuthorSummary(prDetails) {
     stats.testLines.push(pr.testAdditions + pr.testDeletions)
     stats.reviewCounts.push(pr.reviews.length)
     stats.iterations.push(pr.iterationCount)
+    stats.commitCounts.push(pr.commitCount || 1)
+    stats.churnPercentages.push(pr.churnPercentage || 0)
+    stats.fileChurnCounts.push(pr.fileChurnCount || 0)
     
-    // Time to first review
-    const sortedReviews = pr.reviews.sort((a, b) => 
-      new Date(a.submittedAt) - new Date(b.submittedAt)
-    )
-    if (sortedReviews.length > 0) {
-      const firstReviewTime = (new Date(sortedReviews[0].submittedAt) - new Date(pr.createdAt)) / (1000 * 60 * 60)
-      if (firstReviewTime >= 0) {
-        stats.reviewTimes.push(firstReviewTime)
+    // Time to first response (working hours)
+    if (pr.firstResponseAt) {
+      const firstResponseTime = calculateWorkingHours(pr.createdAt, pr.firstResponseAt)
+      if (firstResponseTime >= 0) {
+        stats.reviewTimes.push(firstResponseTime)
       }
     }
     
-    // Time to merge (close time)
-    const closeTime = (new Date(pr.mergedAt) - new Date(pr.createdAt)) / (1000 * 60 * 60)
+    // Time to merge (close time) - working hours
+    const closeTime = calculateWorkingHours(pr.createdAt, pr.mergedAt)
     stats.closeTimes.push(closeTime)
     
     // Per-repo count
     stats.prsByRepo[pr.repo] = (stats.prsByRepo[pr.repo] || 0) + 1
   }
   
+  // Helper function for averages
+  const avg = arr => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
+  
   // Calculate averages
   const summary = []
   for (const [author, stats] of authorStats) {
-    const avgSize = stats.prSizes.length > 0
-      ? stats.prSizes.reduce((a, b) => a + b, 0) / stats.prSizes.length
-      : 0
-    
-    const avgProdLines = stats.prodLines.length > 0
-      ? stats.prodLines.reduce((a, b) => a + b, 0) / stats.prodLines.length
-      : 0
-    
-    const avgTestLines = stats.testLines.length > 0
-      ? stats.testLines.reduce((a, b) => a + b, 0) / stats.testLines.length
-      : 0
-    
-    const avgReviewTime = stats.reviewTimes.length > 0
-      ? stats.reviewTimes.reduce((a, b) => a + b, 0) / stats.reviewTimes.length
-      : null
-    
-    const avgCloseTime = stats.closeTimes.length > 0
-      ? stats.closeTimes.reduce((a, b) => a + b, 0) / stats.closeTimes.length
-      : 0
-    
-    const avgReviewCount = stats.reviewCounts.length > 0
-      ? stats.reviewCounts.reduce((a, b) => a + b, 0) / stats.reviewCounts.length
-      : 0
-    
-    const avgIterations = stats.iterations.length > 0
-      ? stats.iterations.reduce((a, b) => a + b, 0) / stats.iterations.length
-      : 0
+    const avgSize = avg(stats.prSizes)
+    const avgProdLines = avg(stats.prodLines)
+    const avgTestLines = avg(stats.testLines)
+    const avgReviewTime = stats.reviewTimes.length > 0 ? avg(stats.reviewTimes) : null
+    const avgCloseTime = avg(stats.closeTimes)
+    const avgReviewCount = avg(stats.reviewCounts)
+    const avgIterations = avg(stats.iterations)
+    const avgCommits = avg(stats.commitCounts)
+    const avgChurnPct = avg(stats.churnPercentages)
+    const avgFileChurn = avg(stats.fileChurnCounts)
     
     summary.push({
       author,
@@ -487,10 +679,13 @@ function calculateAuthorSummary(prDetails) {
       authoredPrAvgSize: Math.round(avgSize),
       authoredPrAvgProdLines: Math.round(avgProdLines),
       authoredPrAvgTestLines: Math.round(avgTestLines),
-      authoredPrAvgReviewTime: avgReviewTime ? avgReviewTime.toFixed(2) : null,
-      authoredPrAvgCloseTime: avgCloseTime.toFixed(2),
+      authoredPrAvgReviewTime: avgReviewTime ? avgReviewTime.toFixed(2) : null,  // Working hours to first response
+      authoredPrAvgCloseTime: avgCloseTime.toFixed(2),  // Working hours to merge
       authoredPrAvgReviewCount: avgReviewCount.toFixed(2),
       authoredPrAvgIterations: avgIterations.toFixed(2),
+      authoredPrAvgCommits: avgCommits.toFixed(2),
+      authoredPrAvgChurnPct: avgChurnPct.toFixed(1),
+      authoredPrAvgFileChurn: avgFileChurn.toFixed(1),
       ...stats.prsByRepo
     })
   }
@@ -508,6 +703,95 @@ function generateCSV(summary) {
   )
   
   return [headers.join(','), ...rows].join('\n')
+}
+
+// Calculate team-level summary (totals and weighted averages)
+function calculateTeamSummary(authorSummary, reviewerSummary, prDetails) {
+  const validPRs = prDetails.filter(p => !p.error)
+  
+  // Helper functions
+  const sum = arr => arr.reduce((a, b) => a + b, 0)
+  const avg = arr => arr.length > 0 ? sum(arr) / arr.length : 0
+  const median = arr => {
+    if (arr.length === 0) return null
+    const sorted = [...arr].sort((a, b) => a - b)
+    return sorted[Math.floor(sorted.length / 2)]
+  }
+  
+  // Weighted average: weight each author's average by their PR count
+  const weightedAvg = (items, valueField, weightField) => {
+    let totalWeight = 0
+    let weightedSum = 0
+    for (const item of items) {
+      const value = parseFloat(item[valueField]) || 0
+      const weight = item[weightField] || 0
+      weightedSum += value * weight
+      totalWeight += weight
+    }
+    return totalWeight > 0 ? weightedSum / totalWeight : 0
+  }
+  
+  // Calculate authored stats from PRs directly (more accurate than averaging averages)
+  const totalPRs = validPRs.length
+  const prSizes = validPRs.map(p => p.totalAdditions + p.totalDeletions)
+  const prodLines = validPRs.map(p => p.prodAdditions + p.prodDeletions)
+  const testLines = validPRs.map(p => p.testAdditions + p.testDeletions)
+  const iterations = validPRs.map(p => p.iterationCount)
+  const closeTimes = validPRs.map(p => calculateWorkingHours(p.createdAt, p.mergedAt)).filter(h => h > 0)
+  const churnPercentages = validPRs.filter(p => p.churnPercentage !== undefined).map(p => p.churnPercentage)
+  const fileChurnCounts = validPRs.filter(p => p.fileChurnCount !== undefined).map(p => p.fileChurnCount)
+  const commitCounts = validPRs.map(p => p.commitCount || 1)
+  
+  // Collect all response times from PRs with firstResponseAt (working hours)
+  const allResponseTimes = validPRs
+    .filter(p => p.firstResponseAt)
+    .map(p => calculateWorkingHours(p.createdAt, p.firstResponseAt))
+    .filter(t => t > 0)
+  
+  let totalReviews = 0
+  let totalApprovals = 0
+  let totalNoCommentApprovals = 0
+  let totalInlineComments = 0
+  
+  for (const pr of validPRs) {
+    for (const review of pr.reviews) {
+      totalReviews++
+      totalInlineComments += review.inlineCommentCount
+      
+      if (review.state === 'APPROVED') {
+        totalApprovals++
+        if (!review.hasComments) {
+          totalNoCommentApprovals++
+        }
+      }
+    }
+  }
+  
+  return {
+    authored: {
+      totalPRs,
+      totalDevelopers: authorSummary.length,
+      avgPrSize: Math.round(avg(prSizes)),
+      avgProdLines: Math.round(avg(prodLines)),
+      avgTestLines: Math.round(avg(testLines)),
+      avgCloseTime: closeTimes.length > 0 ? parseFloat(avg(closeTimes).toFixed(2)) : null,  // Working hours
+      avgIterations: parseFloat(avg(iterations).toFixed(2)),
+      avgChurnPct: churnPercentages.length > 0 ? parseFloat(avg(churnPercentages).toFixed(1)) : 0,
+      avgFileChurn: fileChurnCounts.length > 0 ? parseFloat(avg(fileChurnCounts).toFixed(1)) : 0,
+      avgCommitsPerPr: parseFloat(avg(commitCounts).toFixed(2))
+    },
+    reviewed: {
+      totalReviews,
+      totalReviewers: reviewerSummary.length,
+      avgPrSizeReviewed: Math.round(weightedAvg(reviewerSummary, 'avgPrSizeReviewed', 'prsReviewedCount')),
+      avgProdLinesReviewed: Math.round(weightedAvg(reviewerSummary, 'avgPrProdLinesReviewed', 'prsReviewedCount')),
+      avgTestLinesReviewed: Math.round(weightedAvg(reviewerSummary, 'avgPrTestLinesReviewed', 'prsReviewedCount')),
+      medianResponseTime: allResponseTimes.length > 0 ? parseFloat(median(allResponseTimes).toFixed(2)) : null,  // Calendar hours
+      overallNoCommentPct: totalApprovals > 0 ? parseFloat((totalNoCommentApprovals / totalApprovals * 100).toFixed(1)) : 0,
+      avgInlineComments: totalReviews > 0 ? parseFloat((totalInlineComments / totalReviews).toFixed(2)) : 0,
+      avgIterationsPerPr: parseFloat(avg(iterations).toFixed(2))
+    }
+  }
 }
 
 // Main execution
@@ -568,6 +852,9 @@ async function main() {
   console.log('📊 Calculating author metrics...')
   const authorSummary = calculateAuthorSummary(prDetails)
   
+  console.log('📊 Calculating team summary...')
+  const teamSummary = calculateTeamSummary(authorSummary, summary, prDetails)
+  
   // Prepare output
   const outputData = {
     month: targetMonth,
@@ -576,6 +863,7 @@ async function main() {
     generatedAt: new Date().toISOString(),
     summary,
     authorSummary,
+    teamSummary,
     details: prDetails
   }
   

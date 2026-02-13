@@ -1,18 +1,17 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { MetricsData } from '@/types/metrics'
 import MonthSelector from '@/components/MonthSelector'
+import DeveloperFilter from '@/components/DeveloperFilter'
+import { computeTeamSummaryFallback } from '@/lib/utils'
 import SummaryCards from '@/components/SummaryCards'
-import OverviewTab from '@/components/OverviewTab'
-import ResponseTimeTab from '@/components/ResponseTimeTab'
+import DeveloperStatsTab from '@/components/DeveloperStatsTab'
 import ComplexityTab from '@/components/ComplexityTab'
-import IterationsTab from '@/components/IterationsTab'
-import AuthorMetricsTab from '@/components/AuthorMetricsTab'
 import ReviewerActivityTab from '@/components/ReviewerActivityTab'
 import DetailTable from '@/components/DetailTable'
 
-type Tab = 'overview' | 'response-time' | 'complexity' | 'iterations' | 'author-metrics' | 'reviewer-activity' | 'details'
+type Tab = 'details' | 'developer-stats' | 'complexity' | 'reviewer-activity'
 
 export default function Home() {
   const [months, setMonths] = useState<string[]>([])
@@ -20,7 +19,9 @@ export default function Home() {
   const [data, setData] = useState<MetricsData | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [activeTab, setActiveTab] = useState<Tab>('overview')
+  const [activeTab, setActiveTab] = useState<Tab>('details')
+  const [excludedDevs, setExcludedDevs] = useState<Set<string>>(new Set())
+  const [excludedPRs, setExcludedPRs] = useState<Set<string>>(new Set())
 
   // Fetch available months on mount
   useEffect(() => {
@@ -44,6 +45,8 @@ export default function Home() {
 
     setLoading(true)
     setError(null)
+    setExcludedDevs(new Set())
+    setExcludedPRs(new Set())
     
     fetch(`/api/data/${selectedMonth}`)
       .then(res => {
@@ -61,14 +64,67 @@ export default function Home() {
       })
   }, [selectedMonth])
 
+  // Derive the full list of developers from unfiltered data (authors + reviewers)
+  const allDevelopers = useMemo(() => {
+    if (!data) return []
+    const devSet = new Set<string>()
+    for (const pr of data.details) {
+      devSet.add(pr.author)
+      for (const review of pr.reviews) {
+        devSet.add(review.reviewer)
+      }
+    }
+    return Array.from(devSet).sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+  }, [data])
+
+  // Compute dev-filtered data: remove excluded devs' authored PRs and strip their reviews
+  // This is used by DetailTable which needs to show excluded PRs (with visual dimming)
+  const devFilteredData = useMemo<MetricsData | null>(() => {
+    if (!data || excludedDevs.size === 0) return data
+
+    const filteredDetails = data.details
+      .filter(pr => !excludedDevs.has(pr.author))
+      .map(pr => ({
+        ...pr,
+        reviews: pr.reviews.filter(r => !excludedDevs.has(r.reviewer)),
+      }))
+
+    const filteredSummary = data.summary.filter(s => !excludedDevs.has(s.reviewer))
+    const filteredAuthorSummary = data.authorSummary.filter(s => !excludedDevs.has(s.author))
+
+    const partial: MetricsData = {
+      ...data,
+      details: filteredDetails,
+      summary: filteredSummary,
+      authorSummary: filteredAuthorSummary,
+      teamSummary: undefined,
+    }
+    partial.teamSummary = computeTeamSummaryFallback(partial)
+    return partial
+  }, [data, excludedDevs])
+
+  // Compute fully filtered data: dev exclusions + PR exclusions applied
+  // Used by all tabs except DetailTable
+  const filteredData = useMemo<MetricsData | null>(() => {
+    if (!devFilteredData || excludedPRs.size === 0) return devFilteredData
+
+    const filteredDetails = devFilteredData.details
+      .filter(pr => !excludedPRs.has(`${pr.repo}#${pr.number}`))
+
+    const partial: MetricsData = {
+      ...devFilteredData,
+      details: filteredDetails,
+      teamSummary: undefined,
+    }
+    partial.teamSummary = computeTeamSummaryFallback(partial)
+    return partial
+  }, [devFilteredData, excludedPRs])
+
   const tabs: { id: Tab; label: string }[] = [
-    { id: 'overview', label: 'Overview' },
-    { id: 'response-time', label: 'Response Time' },
-    { id: 'complexity', label: 'PR Complexity' },
-    { id: 'iterations', label: 'Iterations' },
-    { id: 'author-metrics', label: 'Author Metrics' },
-    { id: 'reviewer-activity', label: 'Reviewer Activity' },
     { id: 'details', label: 'All PRs' },
+    { id: 'developer-stats', label: 'Developer Stats' },
+    { id: 'complexity', label: 'PR Complexity' },
+    { id: 'reviewer-activity', label: 'Reviewer Activity' },
   ]
 
   return (
@@ -83,11 +139,20 @@ export default function Home() {
           </p>
         </header>
 
-        <MonthSelector
-          months={months}
-          selectedMonth={selectedMonth}
-          onSelectMonth={setSelectedMonth}
-        />
+        <div className="flex flex-wrap items-end gap-6 mb-6">
+          <MonthSelector
+            months={months}
+            selectedMonth={selectedMonth}
+            onSelectMonth={setSelectedMonth}
+          />
+          {data && (
+            <DeveloperFilter
+              developers={allDevelopers}
+              excludedDevs={excludedDevs}
+              onChange={setExcludedDevs}
+            />
+          )}
+        </div>
 
         {loading && (
           <div className="flex items-center justify-center py-12">
@@ -101,9 +166,9 @@ export default function Home() {
           </div>
         )}
 
-        {!loading && !error && data && (
+        {!loading && !error && filteredData && (
           <>
-            <SummaryCards data={data} />
+            <SummaryCards data={filteredData} />
 
             <div className="mb-6">
               <div className="border-b border-gray-200 dark:border-gray-700">
@@ -128,13 +193,10 @@ export default function Home() {
             </div>
 
             <div className="mt-6">
-              {activeTab === 'overview' && <OverviewTab data={data} />}
-              {activeTab === 'response-time' && <ResponseTimeTab data={data} />}
-              {activeTab === 'complexity' && <ComplexityTab data={data} />}
-              {activeTab === 'iterations' && <IterationsTab data={data} />}
-              {activeTab === 'author-metrics' && <AuthorMetricsTab data={data} />}
-              {activeTab === 'reviewer-activity' && <ReviewerActivityTab data={data} />}
-              {activeTab === 'details' && <DetailTable data={data} />}
+              {activeTab === 'details' && <DetailTable data={devFilteredData!} excludedPRs={excludedPRs} onExcludedPRsChange={setExcludedPRs} />}
+              {activeTab === 'developer-stats' && <DeveloperStatsTab data={filteredData} />}
+              {activeTab === 'complexity' && <ComplexityTab data={filteredData} />}
+              {activeTab === 'reviewer-activity' && <ReviewerActivityTab data={filteredData} />}
             </div>
           </>
         )}

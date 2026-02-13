@@ -8,7 +8,7 @@ interface MonthSelectorProps {
 
 export default function MonthSelector({ months, selectedMonth, onSelectMonth }: MonthSelectorProps) {
   return (
-    <div className="mb-6">
+    <div>
       <label htmlFor="month-select" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
         Select Month
       </label>
